@@ -6,10 +6,9 @@ Offline AI dictation for Windows, like Win+H but using Whisper (small.en) runnin
 
 1. Download **WorkDictate.zip** from the [latest release](../../releases/latest) and extract it anywhere (e.g. `Documents\WorkDictate`).
 2. Run `WorkDictate.exe`. A mic icon appears in the system tray: grey while loading, then blue when ready.
-3. Click into any text box and press **Ctrl+Alt+Space**. You'll hear a beep and the icon turns red. Speak.
-4. Press **Ctrl+Alt+Space** again. The icon turns amber, and a second or two later the text is pasted where your cursor is.
-
-Press **Esc** while recording to cancel. To quit, right-click the tray icon and choose Quit.
+3. Click into any text box and press **Ctrl+Alt+Space**. You'll hear a beep and the icon turns red. Start talking.
+4. Each phrase is typed at your cursor as soon as you pause, so text appears as you talk. The icon flashes amber while it writes.
+5. Press **Ctrl+Alt+Space** again (or **Esc**) to stop. To quit, right-click the tray icon and choose Quit.
 
 ## Settings
 
@@ -21,13 +20,16 @@ Press **Esc** while recording to cancel. To quit, right-click the tray icon and 
 | `model` | `models/small.en` | any faster-whisper / CTranslate2 model folder |
 | `beam_size` | `1` | 5 is a bit more accurate, and slower |
 | `beeps` | `true` | start/stop sounds |
-| `trailing_space` | `true` | adds a space after each insert |
+| `trailing_space` | `true` | adds a space after each phrase |
+| `pause_seconds` | `0.6` | how long a pause ends a phrase; lower means text appears sooner |
+| `max_phrase_seconds` | `15` | forces a phrase out if you talk without pausing |
+| `type_method` | `keys` | `keys` types the text in; `paste` uses the clipboard (for apps that drop typed keys) |
 
 Restart the app after editing. Errors are written to `dictate.log`.
 
 ## Notes
 
-- Text is inserted via the clipboard (Ctrl+V); your previous clipboard contents are restored afterwards.
+- By default text is typed in as keystrokes, so your clipboard isn't touched. With `paste`, your previous clipboard contents are restored afterwards.
 - To autostart it, put a shortcut to the exe in `shell:startup`.
 - Typing into windows running as admin won't work unless the app also runs as admin.
 

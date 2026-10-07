@@ -1,8 +1,8 @@
 """Work Dictate - offline push-to-dictate for Windows.
 
-Press the hotkey (default Ctrl+Alt+Space) to start recording, press it again
-to stop. The speech is transcribed locally with Whisper and pasted into
-whichever window has focus. Esc while recording cancels.
+Press the hotkey (default Ctrl+Alt+Space) to start listening, press it again
+to stop. Each phrase is transcribed locally with Whisper as soon as you pause
+and typed at the cursor of whichever window has focus. Esc also stops.
 """
 import ctypes
 import json
@@ -15,6 +15,8 @@ import winsound
 
 import keyboard
 import numpy as np
+import queue
+
 import pyperclip
 import pystray
 import sounddevice as sd
@@ -31,6 +33,9 @@ DEFAULTS = {
     "beam_size": 1,
     "beeps": True,
     "trailing_space": True,
+    "pause_seconds": 0.6,
+    "max_phrase_seconds": 15,
+    "type_method": "keys",
 }
 
 logging.basicConfig(
@@ -79,7 +84,7 @@ class Dictate:
         self.cfg = cfg
         self.model = None
         self.recording = False
-        self.frames = []
+        self.audio_q = queue.Queue()
         self.stream = None
         self.lock = threading.Lock()
         self.tray = pystray.Icon(APP, ICONS["loading"], f"{APP} - loading model...", menu=pystray.Menu(
@@ -113,17 +118,17 @@ class Dictate:
             self.set_state("loading", f"model failed: {e}")
 
     def on_audio(self, indata, frames, t, status):
-        self.frames.append(indata[:, 0].copy())
+        self.audio_q.put(indata[:, 0].copy())
 
     def toggle(self):
         with self.lock:
             if self.model is None:
                 return
             if not self.recording:
-                self.frames = []
+                self.audio_q = queue.Queue()
                 try:
                     self.stream = sd.InputStream(samplerate=RATE, channels=1, dtype="float32",
-                                                 callback=self.on_audio)
+                                                 blocksize=RATE // 10, callback=self.on_audio)
                     self.stream.start()
                 except Exception as e:
                     log.exception("mic open failed")
@@ -131,32 +136,58 @@ class Dictate:
                     return
                 self.recording = True
                 self.beep(880)
-                self.set_state("recording", "listening... (hotkey to stop, Esc to cancel)")
+                self.set_state("recording", "listening... (hotkey or Esc to stop)")
+                threading.Thread(target=self.listen, args=(self.audio_q,), daemon=True).start()
             else:
-                self.stop_stream()
-                self.beep(660)
-                audio = np.concatenate(self.frames) if self.frames else np.zeros(0, np.float32)
-                threading.Thread(target=self.transcribe, args=(audio,), daemon=True).start()
+                self.stop()
 
     def cancel(self):
         with self.lock:
             if self.recording:
-                self.stop_stream()
-                self.beep(440)
-                self.set_state("idle", f"cancelled ({self.cfg['hotkey']})")
+                self.stop()
 
-    def stop_stream(self):
+    def stop(self):
         self.recording = False
         if self.stream:
             self.stream.stop()
             self.stream.close()
             self.stream = None
+        self.audio_q.put(None)  # flush whatever is left
+        self.beep(660)
+
+    def listen(self, q):
+        """Cut the mic stream into phrases at pauses and transcribe each one."""
+        pause_blocks = int(self.cfg["pause_seconds"] * 10)
+        max_blocks = int(self.cfg["max_phrase_seconds"] * 10)
+        noise = 0.003
+        phrase, speaking, quiet = [], False, 0
+        while True:
+            block = q.get()
+            if block is None:
+                if speaking:
+                    self.transcribe(np.concatenate(phrase))
+                break
+            rms = float(np.sqrt(np.mean(block ** 2)))
+            loud = rms > max(0.006, noise * 3)
+            if not loud:
+                noise = 0.95 * noise + 0.05 * rms
+            if not speaking:
+                phrase = (phrase + [block])[-3:]  # keep 0.3s of lead-in
+                if loud:
+                    speaking, quiet = True, 0
+                continue
+            phrase.append(block)
+            quiet = 0 if loud else quiet + 1
+            if quiet >= pause_blocks or len(phrase) >= max_blocks:
+                self.transcribe(np.concatenate(phrase))
+                phrase, speaking, quiet = [], False, 0
+        self.set_state("idle", f"ready ({self.cfg['hotkey']})")
 
     def transcribe(self, audio):
-        if len(audio) < RATE * 0.3:
-            self.set_state("idle", f"ready ({self.cfg['hotkey']})")
+        if len(audio) < RATE * 0.4:
             return
-        self.set_state("busy", "transcribing...")
+        if self.recording:
+            self.set_state("busy", "listening... (writing)")
         try:
             t = time.time()
             segments, _ = self.model.transcribe(
@@ -165,12 +196,22 @@ class Dictate:
             text = " ".join(s.text.strip() for s in segments).strip()
             log.info("%.1fs audio -> %.1fs: %r", len(audio) / RATE, time.time() - t, text)
             if text:
-                self.paste(text + (" " if self.cfg["trailing_space"] else ""))
-        except Exception as e:
+                self.write(text + (" " if self.cfg["trailing_space"] else ""))
+        except Exception:
             log.exception("transcribe failed")
-            self.set_state("idle", f"error: {e}")
-            return
-        self.set_state("idle", f"ready ({self.cfg['hotkey']})")
+        if self.recording:
+            self.set_state("recording", "listening... (hotkey or Esc to stop)")
+
+    def write(self, text):
+        # wait for any held modifiers so they don't combine with the typed keys
+        for _ in range(40):
+            if not any(keyboard.is_pressed(k) for k in ("ctrl", "alt", "shift", "windows")):
+                break
+            time.sleep(0.05)
+        if self.cfg["type_method"] == "paste":
+            self.paste(text)
+        else:
+            keyboard.write(text)
 
     def paste(self, text):
         try:
@@ -178,11 +219,6 @@ class Dictate:
         except Exception:
             old = None
         pyperclip.copy(text)
-        # wait for the hotkey's modifiers to be released so they don't combine with Ctrl+V
-        for _ in range(40):
-            if not any(keyboard.is_pressed(k) for k in ("alt", "shift", "windows")):
-                break
-            time.sleep(0.05)
         keyboard.send("ctrl+v")
         time.sleep(0.4)
         if old is not None:
